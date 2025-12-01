@@ -10,7 +10,8 @@ The script:
 - **Locks down SSH (port 22) to only your chosen LAN networks + external IPs**  
 - **Optionally enforces Cloudflare-only access for ports 80/443 (to further lockdown 44Net-Secure-Portal44Net-Secure-Portal
 )**  
-- **Automatically fetches Cloudflare edge IP ranges (IPv4+IPv6)**  
+- **Automatically fetches Cloudflare edge IP ranges (IPv4+IPv6)**
+- **Optionally allows outbound NTP (UDP/123) for Authelia/system time sync**
 - **Creates & validates a new nftables.conf**  
 - **Includes a 60-second TEST MODE with automatic rollback**  
 - **Backs up your existing nftables.conf before applying changes**  
@@ -103,7 +104,14 @@ Choose between:
 - Cloudflare-only
 - Open Internet access
 
-### 5. Apply & Validate
+### 5. Outbound NTP (UDP/123) for Authelia and System Time Sync (required for portal)
+Authelia performs its own NTP checks. If outbound UDP/123 is blocked,
+it may log errors or fail startup checks even if system time is OK
+Choose between:
+- Allow outbound NTP (UDP/123)
+- Block outbound NTP (not recommended if using Authelia NTP checks)
+
+### 6. Apply & Validate
 - Script generates an optimized nftables.conf
 - Uses `nft -c` to validate
 - Applies, reloads nftables, and persists on reboot
@@ -121,11 +129,23 @@ LAN networks: 192.168.0.0/16
 External IPs: 203.0.xxx.xxx, 44.xx.xxx.xxx
 
 === HTTP/HTTPS Hardening ===
-1) Cloudflare-only
-2) Open to internet
+1) Cloudflare ONLY on ports 80/443 (recommended if using Cloudflare proxy
+- Only Cloudflare edge IPs can reach HTTP/HTTPS
+- Server is effectively hidden behind Cloudflare
+2) Leave ports 80/443 open to the internet
 Choose 1 or 2 [1]:
 
 Fetching Cloudflare IP ranges...
+
+=== Outbound NTP (UDP/123) for Authelia and System Time Sync (required for portal) ==="
+Authelia performs its own NTP checks. If outbound UDP/123 is blocked,
+it may log errors or fail startup checks even if system time is OK.
+  
+1) Allow outbound NTP (UDP/123) [recommended]
+2) Block outbound NTP (not recommended if using Authelia NTP checks)
+  
+Allow outbound NTP (UDP/123)? [1]:
+
 Validation OK.
 Apply this configuration? [y/N]:
 ```
