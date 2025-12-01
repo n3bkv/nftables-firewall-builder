@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Interactive nftables firewall setup (with Cloudflare dynamic IPs + test mode)
+# Interactive nftables firewall setup (with Cloudflare dynamic IPs + test mode + optional NTP)
 # - Backs up /etc/nftables.conf
 # - Prompts for SSH whitelist IPs (LAN + external)
 # - Optionally enables Cloudflare-only access on ports 80/443
+# - Optionally allows outbound NTP (UDP/123) for Authelia/system time sync
 # - Dynamically fetches Cloudflare IP ranges when needed
 # - Generates new /etc/nftables.conf
 # - Validates with nft -c and applies
@@ -18,6 +19,7 @@ TEMP_CONF="/tmp/nftables.conf.$$"
 LAST_BACKUP=""
 TEST_MODE="n"
 CF_CHOICE="1"
+ALLOW_NTP="y"   # default: allow outbound NTP
 
 LAN_ARRAY=()
 EXT_ARRAY=()
@@ -98,6 +100,24 @@ prompt_cloudflare_mode() {
   if [[ "$CF_CHOICE" != "1" && "$CF_CHOICE" != "2" ]]; then
     echo "Invalid choice. Defaulting to 1 (Cloudflare only)."
     CF_CHOICE="1"
+  fi
+}
+
+prompt_ntp_option() {
+  echo
+  echo "=== Outbound NTP (UDP/123) for Authelia and System Time Sync (required for portal ==="
+  echo "Authelia performs its own NTP checks. If outbound UDP/123 is blocked,"
+  echo "it may log errors or fail startup checks even if system time is OK."
+  echo
+  echo "1) Allow outbound NTP (UDP/123) [recommended]"
+  echo "2) Block outbound NTP (not recommended if using Authelia NTP checks)"
+  echo
+  read -rp "Allow outbound NTP (UDP/123)? [1]: " NTP_CHOICE
+  NTP_CHOICE="${NTP_CHOICE:-1}"
+  if [[ "$NTP_CHOICE" == "1" ]]; then
+    ALLOW_NTP="y"
+  else
+    ALLOW_NTP="n"
   fi
 }
 
@@ -271,7 +291,7 @@ CFHTTP
 OPENHTTP
     fi
 
-    #----------------- Final default drop -------------------------------------
+    #----------------- Final default drop for INPUT ---------------------------
     cat <<'FOOTER'
 
         #########################################################
@@ -279,9 +299,38 @@ OPENHTTP
         #########################################################
         drop
     }
-}
+
 FOOTER
 
+    #----------------- Output chain (new, default accept) ---------------------
+    echo
+    echo "    #############################################################"
+    echo "    # Outbound / Output Chain"
+    echo "    #############################################################"
+    echo "    chain output {"
+    echo "        type filter hook output priority 0;"
+    echo
+    echo "        # Allow established/related outbound"
+    echo "        ct state established,related accept"
+    echo
+    echo "        # Allow all outbound traffic by default (policy accept)"
+    echo "        # Below we add explicit rules mainly for clarity and future hardening."
+    echo
+    echo "        # DNS outbound"
+    echo "        udp dport 53 accept"
+    echo "        tcp dport {53,80,443} accept"
+    echo
+    if [[ "$ALLOW_NTP" == "y" ]]; then
+      echo "        # Allow outbound NTP for Authelia/system time sync"
+      echo "        udp dport 123 accept"
+    else
+      echo "        # Outbound NTP (UDP/123) intentionally not whitelisted"
+    fi
+    echo
+    echo "        # Default accept for anything else"
+    echo "        accept"
+    echo "    }"
+    echo "}"
   } > "$TEMP_CONF"
 
   echo "New config written to $TEMP_CONF"
@@ -372,6 +421,7 @@ backup_conf
 prompt_test_mode
 prompt_ssh_whitelist
 prompt_cloudflare_mode
+prompt_ntp_option
 require_curl_if_cloudflare
 fetch_cloudflare_ips
 build_conf
