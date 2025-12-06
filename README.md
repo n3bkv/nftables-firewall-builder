@@ -169,6 +169,95 @@ Confirm firewall rules? [y/N]:
 
 ---
 
+## Docker Compatibility & NAT
+
+This script is designed to play nicely with Docker (Traefik, Authelia, Node-RED, etc.) on the same host.
+
+### Separate nftables table: `inet firewall`
+
+Docker uses iptables in "nft" mode and creates its own tables/chains, e.g.:
+
+- `DOCKER`, `DOCKER-USER`, `DOCKER-FORWARD` in the `filter` table  
+- NAT rules in the `nat` table
+
+If you `nft flush ruleset`, you wipe those out and later see errors like:
+
+```text
+Failed to Setup IP tables: Unable to enable ACCEPT OUTGOING rule:
+(iptables failed: ... DOCKER-FORWARD ... No chain/target/match by that name.)
+```
+
+To avoid this, the script:
+
+Uses its own table: table inet firewall { ... }
+
+Applies rules with nft -f /etc/nftables.conf without flushing the entire ruleset
+
+This lets your firewall coexist with Docker’s internal rules.
+
+Input/Forward rules friendly to Docker
+
+In the generated config, the input chain includes:
+
+```text
+
+iifname "docker0" accept
+iifname "br-*" accept
+
+```
+
+This allows containers on Docker bridges to talk to the host (for example, Traefik calling Authelia on http://authelia:9091, or hitting host services bound to 127.0.0.1/0.0.0.0).
+
+The forward chain is also Docker-friendly:
+
+```text
+
+chain forward {
+    type filter hook forward priority 0; policy accept;
+
+    ct state established,related accept
+    accept
+}
+
+```
+
+This leaves container-to-container and container-to-LAN routing to Docker and any iptables rules it manages.
+
+Docker NAT helper (MASQUERADE)
+
+If Docker is installed and running, the script will offer an optional NAT helper step:
+
+It detects (or prompts for) the Docker bridge subnet (e.g. 172.17.0.0/16).
+
+It offers to add a MASQUERADE rule to the iptables nat table:
+
+```text
+
+iptables -t nat -I POSTROUTING 1 -s <docker-subnet> ! -o docker0 -j MASQUERADE
+
+
+```
+
+Why this matters:
+
+Without NAT, when a container (e.g. Traefik at 172.18.0.x) calls a LAN host (e.g. Node-RED at 192.168.50.100:1880), the LAN host sees a source IP in 172.18.0.0/16 and has no route back → connections hang.
+
+With MASQUERADE, the source is rewritten to the host LAN IP (e.g. 192.168.50.52), and replies just work.
+
+The script can also optionally persist this NAT rule via iptables-persistent if apt-get is available:
+
+```text
+
+sudo apt-get install iptables-persistent
+sudo iptables-save > /etc/iptables/rules.v4
+
+```
+
+You can rerun the script later to adjust firewall rules without breaking Docker, and the NAT rule will remain intact.
+
+---
+
+
 ## Requirements
 
 - Linux system with **nftables**
