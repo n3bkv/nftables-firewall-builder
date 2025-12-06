@@ -6,9 +6,10 @@
 # - Optionally enables Cloudflare-only access on ports 80/443
 # - Optionally allows outbound NTP (UDP/123) for Authelia/system time sync
 # - Dynamically fetches Cloudflare IP ranges when needed
-# - Generates new /etc/nftables.conf
-# - Validates with nft -c and applies
+# - Generates new /etc/nftables.conf (using table inet firewall)
+# - Validates with nft -c and applies WITHOUT flushing Docker’s tables
 # - Optional TEST MODE auto-rolls back to backup after 60s unless confirmed
+# - Detects Docker and can add a MASQUERADE rule so containers can reach LAN hosts
 
 set -euo pipefail
 
@@ -105,7 +106,7 @@ prompt_cloudflare_mode() {
 
 prompt_ntp_option() {
   echo
-  echo "=== Outbound NTP (UDP/123) for Authelia and System Time Sync (required for portal ==="
+  echo "=== Outbound NTP (UDP/123) for Authelia and System Time Sync ==="
   echo "Authelia performs its own NTP checks. If outbound UDP/123 is blocked,"
   echo "it may log errors or fail startup checks even if system time is OK."
   echo
@@ -193,6 +194,81 @@ print_cf_set_ipv6() {
   echo
 }
 
+detect_docker_and_offer_nat() {
+  echo
+  echo "=== Docker / NAT Helper (optional) ==="
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker not detected (docker command not found). Skipping Docker NAT helper."
+    return 0
+  fi
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables not found. Cannot manage Docker NAT rules automatically."
+    echo "If you use Docker containers that talk to LAN hosts, consider adding a MASQUERADE rule manually."
+    return 0
+  fi
+
+  # Probe Docker availability
+  if ! docker info >/dev/null 2>&1; then
+    echo "Docker appears to be installed but not running or not accessible. Skipping Docker NAT helper."
+    return 0
+  fi
+
+  # Try to detect the default bridge subnet
+  local docker_subnet
+  docker_subnet="$(docker network inspect bridge -f '{{ (index .IPAM.Config 0).Subnet }}' 2>/dev/null || true)"
+
+  if [[ -z "$docker_subnet" ]]; then
+    docker_subnet="172.17.0.0/16"
+    echo
+    echo "Could not auto-detect Docker bridge subnet; defaulting to: ${docker_subnet}"
+    read -rp "Enter Docker bridge subnet to use for NAT [${docker_subnet}]: " USER_DOCKER_SUBNET
+    docker_subnet="${USER_DOCKER_SUBNET:-$docker_subnet}"
+  else
+    echo
+    echo "Detected Docker bridge subnet: ${docker_subnet}"
+  fi
+
+  echo
+  echo "If Docker containers (e.g. Traefik) need to talk to LAN hosts (e.g. Node-RED at 192.168.x.x),"
+  echo "you should have a MASQUERADE rule so replies can find their way back."
+  echo
+  echo "Proposed iptables NAT rule:"
+  echo "  iptables -t nat -I POSTROUTING 1 -s ${docker_subnet} ! -o docker0 -j MASQUERADE"
+  echo
+  read -rp "Add this Docker MASQUERADE rule now? [Y/n]: " ADD_NAT
+  ADD_NAT="${ADD_NAT:-Y}"
+
+  if [[ "$ADD_NAT" =~ ^[Yy]$ ]]; then
+    # Only add if not already present
+    if iptables -t nat -C POSTROUTING -s "$docker_subnet" ! -o docker0 -j MASQUERADE 2>/dev/null; then
+      echo "MASQUERADE rule for ${docker_subnet} already exists. Skipping."
+    else
+      echo "Adding MASQUERADE rule for Docker subnet ${docker_subnet}..."
+      iptables -t nat -I POSTROUTING 1 -s "$docker_subnet" ! -o docker0 -j MASQUERADE
+      echo "Rule added."
+    fi
+
+    echo
+    read -rp "Persist this NAT rule using iptables-persistent? [y/N]: " PERSIST_NAT
+    PERSIST_NAT="${PERSIST_NAT:-n}"
+
+    if [[ "$PERSIST_NAT" =~ ^[Yy]$ ]]; then
+      if command -v apt-get >/dev/null 2>&1; then
+        echo "Installing iptables-persistent (if needed) and saving rules..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1 || true
+        iptables-save >/etc/iptables/rules.v4
+        echo "iptables NAT rules saved to /etc/iptables/rules.v4"
+      else
+        echo "apt-get not found. Please save iptables rules manually for persistence."
+      fi
+    fi
+  else
+    echo "Skipping Docker MASQUERADE rule."
+  fi
+}
+
 build_conf() {
   echo
   echo "Building new nftables configuration..."
@@ -200,7 +276,9 @@ build_conf() {
   {
     echo '#!/usr/sbin/nft -f'
     echo
-    echo 'table inet filter {'
+    # Use our own table to avoid stepping on Docker's inet filter table
+    echo 'delete table inet firewall'
+    echo 'table inet firewall {'
 
     #--- Cloudflare sets (only if user chose CF-only mode) --------------------
     if [[ "$CF_CHOICE" == "1" ]]; then
@@ -220,20 +298,27 @@ build_conf() {
     #############################################################
 
     chain input {
-        type filter hook input priority 0;
+        type filter hook input priority 0; policy drop;
 
         # Allow loopback
         iif lo accept
 
-        # Allow established traffic
+        # Allow established / related
         ct state established,related accept
+
+        #########################################################
+        # Docker bridge traffic (containers hitting host)
+        # This keeps Docker-based services (Traefik, Authelia, etc.)
+        # talking to the host without fighting Docker's own rules.
+        #########################################################
+        iifname "docker0" accept
+        iifname "br-*" accept
 
         #########################################################
         # Basic ICMP (ping) - optional but handy
         #########################################################
-
         ip protocol icmp accept
-        ip6 nexthdr ipv6-icmp accept
+        ip6 nexthdr icmpv6 accept
 
 HEADER
 
@@ -247,17 +332,17 @@ HEADER
       echo "        # WARNING: No SSH whitelist specified. SSH will be blocked for everyone."
     fi
 
-    # LAN networks
+    # LAN networks (also implicitly "trusted" for SSH)
     for lan in "${LAN_ARRAY[@]}"; do
       [[ -z "$lan" ]] && continue
-      echo "        # LAN network"
+      echo "        # LAN network allowed to SSH"
       echo "        ip saddr ${lan} tcp dport 22 accept"
     done
 
     # External IPs
     for ip in "${EXT_ARRAY[@]}"; do
       [[ -z "$ip" ]] && continue
-      echo "        # External trusted IP"
+      echo "        # External trusted IP for SSH"
       echo "        ip saddr ${ip} tcp dport 22 accept"
     done
 
@@ -291,32 +376,45 @@ CFHTTP
 OPENHTTP
     fi
 
-    #----------------- Final default drop for INPUT ---------------------------
+    #----------------- Default drop for remaining INPUT traffic ---------------
     cat <<'FOOTER'
 
         #########################################################
-        # Default policy: drop everything else
+        # Default policy: drop everything else (policy drop)
         #########################################################
         drop
     }
 
 FOOTER
 
-    #----------------- Output chain (new, default accept) ---------------------
+    #----------------- Forward chain (Docker-friendly) ------------------------
+    echo
+    echo "    #############################################################"
+    echo "    # Forward Chain (allow Docker to manage container routing)"
+    echo "    #############################################################"
+    cat <<'FWD'
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+
+        # Let Docker/userland manage forwarding; we mainly enforce on input.
+        ct state established,related accept
+        accept
+    }
+
+FWD
+
+    #----------------- Output chain (default accept) -------------------------
     echo
     echo "    #############################################################"
     echo "    # Outbound / Output Chain"
     echo "    #############################################################"
     echo "    chain output {"
-    echo "        type filter hook output priority 0;"
+    echo "        type filter hook output priority 0; policy accept;"
     echo
     echo "        # Allow established/related outbound"
     echo "        ct state established,related accept"
     echo
-    echo "        # Allow all outbound traffic by default (policy accept)"
-    echo "        # Below we add explicit rules mainly for clarity and future hardening."
-    echo
-    echo "        # DNS outbound"
+    echo "        # DNS + web outbound"
     echo "        udp dport 53 accept"
     echo "        tcp dport {53,80,443} accept"
     echo
@@ -360,10 +458,11 @@ apply_conf() {
 
   cp "$TEMP_CONF" "$NFT_CONF"
   echo "Applying configuration..."
-  nft flush ruleset
+  # IMPORTANT: do NOT flush the entire ruleset, to avoid destroying Docker's tables.
   nft -f "$NFT_CONF"
   systemctl enable nftables >/dev/null 2>&1 || true
-  systemctl restart nftables
+  # reload if supported; fallback to restart
+  systemctl reload nftables 2>/dev/null || systemctl restart nftables
   echo "nftables rules applied."
 
   if [[ "$TEST_MODE" == "y" ]]; then
@@ -394,9 +493,9 @@ test_mode_rollback_logic() {
       cp "$LAST_BACKUP" "$NFT_CONF"
     fi
 
-    nft flush ruleset
+    # Re-apply the backup config, but again do NOT flush the whole ruleset.
     nft -f "$NFT_CONF"
-    systemctl restart nftables
+    systemctl reload nftables 2>/dev/null || systemctl restart nftables
   ) &
   local rollback_pid=$!
 
@@ -424,6 +523,7 @@ prompt_cloudflare_mode
 prompt_ntp_option
 require_curl_if_cloudflare
 fetch_cloudflare_ips
+detect_docker_and_offer_nat
 build_conf
 apply_conf
 
